@@ -4,11 +4,66 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::db::DatabaseService;
+
+pub enum OperationType {
+    IoIntensive,
+    CpuIntensive,
+}
 use crate::matching_service::MatchingService;
 use crate::models::{IntegrationConfig, MatchingStats};
 use crate::publication_service::PublicationDataService;
 use crate::pubmed_engine::PubMedProcessingEngine;
 
+pub struct ParallelProcessingConfig {
+    pub max_threads: usize,
+    pub adaptive_threading: bool,
+    pub io_bound_thread_multiplier: f32,
+    pub cpu_bound_thread_multiplier: f32,
+    pub memory_limit_per_thread_mb: usize,
+}
+
+impl Default for ParallelProcessingConfig {
+    fn default() -> Self {
+        Self {
+            max_threads: num_cpus::get(),
+            adaptive_threading: true,
+            io_bound_thread_multiplier: 2.0,
+            cpu_bound_thread_multiplier: 1.0,
+            memory_limit_per_thread_mb: 512,
+        }
+    }
+}
+
+impl ParallelProcessingConfig {
+    pub fn calculate_optimal_threads(&self, operation_type: OperationType) -> usize {
+        let available_memory = self.get_available_system_memory_mb();
+        let base_threads = match self.adaptive_threading {
+            true => num_cpus::get(),
+            false => self.max_threads,
+        };
+
+        // Calculate thread count based on operation type
+        let thread_count = match operation_type {
+            OperationType::IoIntensive => {
+                (base_threads as f32 * self.io_bound_thread_multiplier) as usize
+            },
+            OperationType::CpuIntensive => {
+                (base_threads as f32 * self.cpu_bound_thread_multiplier) as usize
+            },
+        };
+
+        // Limit by available memory
+        let memory_limited_threads = available_memory / self.memory_limit_per_thread_mb;
+
+        thread_count.min(memory_limited_threads).max(1)
+    }
+    
+    fn get_available_system_memory_mb(&self) -> usize {
+        // Simple implementation - in a real application, you would use a system-specific method
+        // to determine available memory
+        4096 // Default to 4GB
+    }
+}
 pub struct IntegrationController {
     config: IntegrationConfig,
     publication_service: PublicationDataService,
@@ -198,5 +253,55 @@ impl IntegrationController {
         info!("Exported {} enriched publications to CSV", enriched.len());
 
         Ok(enriched.len())
+    }
+    // In src/integration_controller.rs
+    pub async fn execute_streaming<F>(&mut self, callback: F) -> Result<MatchingStats>
+    where
+        F: FnMut(PublicationData) -> Result<()>,
+    {
+        let start_time = Instant::now();
+
+        // Process publications in small batches, streaming results to callback
+        let chunk_size = 500;
+        let mut batch_start = 0;
+
+        loop {
+            let publications_batch = self
+                .db_service
+                .load_publications_batch(batch_start, chunk_size)
+                .await?;
+
+            if publications_batch.is_empty() {
+                break;
+            }
+
+            // Process this batch, streaming results rather than accumulating
+            for publication in &publications_batch {
+                self.publication_service
+                    .add_publication(publication.clone());
+            }
+
+            // Find matches for this batch only
+            let (batch_matches, _) = self.matching_service.find_matches_for_batch(
+                &self.publication_service,
+                &publications_batch,
+                &self.pubmed_records,
+            )?;
+
+            // Stream results through callback
+            callback(PublicationData {
+                publications: publications_batch,
+                matches: batch_matches,
+            })?;
+
+            // Prepare for next batch
+            batch_start += publications_batch.len();
+
+            // Clear batch data to free memory
+            self.publication_service.clear_batch(&publications_batch);
+        }
+
+        // Return statistics
+        Ok(self.matching_service.get_stats())
     }
 }

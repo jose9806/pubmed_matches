@@ -1,0 +1,50 @@
+# Dockerfile.processor - Multi-stage build for smaller, faster containers
+FROM rust:1.71-slim as builder
+
+WORKDIR /app
+# Install necessary dependencies
+RUN apt-get update && apt-get install -y \
+    pkg-config \
+    libssl-dev \
+    libpq-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create a new empty shell project
+RUN USER=root cargo new --bin pubmed_integration
+WORKDIR /app/pubmed_integration
+
+# Copy manifests
+COPY ./Cargo.lock ./Cargo.lock
+COPY ./Cargo.toml ./Cargo.toml
+COPY ./pyproject.toml ./pyproject.toml
+COPY ./poetry.lock ./poetry.lock
+
+# Build dependencies - this is the caching layer
+RUN cargo build --release
+RUN rm src/*.rs
+
+# Copy source code
+COPY ./src ./src
+
+# Build application with optimizations
+RUN rm ./target/release/deps/pubmed_integration*
+RUN RUSTFLAGS="-C target-cpu=native" cargo build --release
+
+# Runtime stage
+FROM debian:bullseye-slim
+
+RUN apt-get update && apt-get install -y \
+    libpq5 \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary from builder
+COPY --from=builder /app/pubmed_integration/target/release/pubmed_integration /app/pubmed_integration
+
+# Set environment variables
+ENV RUST_LOG=info
+
+# Run the binary
+ENTRYPOINT ["/app/pubmed_integration"]
