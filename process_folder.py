@@ -325,6 +325,52 @@ class PubMedXmlProcessor:
 
         return total_records
 
+    def _flush_records_to_temp_tables(self, records, authors, mesh_terms):
+        """Flush batched records to temporary tables to reduce memory usage."""
+        try:
+            with self.db_manager.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Import pubmed records
+                    if records:
+                        self._copy_data(
+                            cursor,
+                            "pubmed_records_temp",
+                            records,
+                            columns=[
+                                "pmid",
+                                "title",
+                                "title_normalized",
+                                "journal",
+                                "volume",
+                                "issue",
+                                "year",
+                                "abstract",
+                                "source_file",
+                            ],
+                        )
+
+                    # Import authors
+                    if authors:
+                        self._copy_data(
+                            cursor,
+                            "pubmed_authors_temp",
+                            authors,
+                            columns=["pmid", "author_name", "position"],
+                        )
+
+                    # Import mesh terms
+                    if mesh_terms:
+                        self._copy_data(
+                            cursor,
+                            "pubmed_mesh_temp",
+                            mesh_terms,
+                            columns=["pmid", "mesh_term"],
+                        )
+
+                    conn.commit()
+        except Exception as e:
+            logger.error(f"Failed to flush records batch: {e}")
+
     def process_xml_file(self, file_path: str) -> Optional[Dict[str, List]]:
         """Process a single XML file and return extracted data."""
         file_name = os.path.basename(file_path)
