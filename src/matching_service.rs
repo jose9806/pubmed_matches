@@ -72,12 +72,14 @@ impl LshMatcher {
         // Create random hash functions
         for i in 0..num_functions {
             let seed = i as u64;
-            hash_functions.push(Box::new(move |text: &str| {
-                let mut hasher = DefaultHasher::new();
-                hasher.write_u64(seed);
-                hasher.write(text.as_bytes());
-                hasher.finish()
-            }));
+            hash_functions.push(Box::new(
+                move |text: &str| {
+                    let mut hasher = DefaultHasher::new();
+                    hasher.write_u64(seed);
+                    hasher.write(text.as_bytes());
+                    hasher.finish()
+                }
+            ) as Box<dyn for<'a> Fn(&'a str) -> u64 + 'static>);
         }
 
         Self {

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
-use log::{debug, info, warn};
-use std::path::{Path, PathBuf};
+use log::info;
+use std::path::Path;
 use std::time::Instant;
 
 use crate::db::DatabaseService;
@@ -10,9 +10,14 @@ pub enum OperationType {
     CpuIntensive,
 }
 use crate::matching_service::MatchingService;
-use crate::models::{IntegrationConfig, MatchingStats};
+use crate::models::{IntegrationConfig, Match, MatchingStats};
 use crate::publication_service::PublicationDataService;
 use crate::pubmed_engine::PubMedProcessingEngine;
+
+pub struct PublicationData {
+    pub publications: Vec<crate::models::Publication>,
+    pub matches: Vec<crate::models::Match>,
+}
 
 pub struct ParallelProcessingConfig {
     pub max_threads: usize,
@@ -46,10 +51,10 @@ impl ParallelProcessingConfig {
         let thread_count = match operation_type {
             OperationType::IoIntensive => {
                 (base_threads as f32 * self.io_bound_thread_multiplier) as usize
-            },
+            }
             OperationType::CpuIntensive => {
                 (base_threads as f32 * self.cpu_bound_thread_multiplier) as usize
-            },
+            }
         };
 
         // Limit by available memory
@@ -57,7 +62,7 @@ impl ParallelProcessingConfig {
 
         thread_count.min(memory_limited_threads).max(1)
     }
-    
+
     fn get_available_system_memory_mb(&self) -> usize {
         // Simple implementation - in a real application, you would use a system-specific method
         // to determine available memory
@@ -255,7 +260,7 @@ impl IntegrationController {
         Ok(enriched.len())
     }
     // In src/integration_controller.rs
-    pub async fn execute_streaming<F>(&mut self, callback: F) -> Result<MatchingStats>
+    pub async fn execute_streaming<F>(&mut self, mut callback: F) -> Result<MatchingStats>
     where
         F: FnMut(PublicationData) -> Result<()>,
     {
@@ -263,13 +268,27 @@ impl IntegrationController {
 
         // Process publications in small batches, streaming results to callback
         let chunk_size = 500;
-        let mut batch_start = 0;
 
-        loop {
-            let publications_batch = self
-                .db_service
-                .load_publications_batch(batch_start, chunk_size)
-                .await?;
+        let db = self
+            .db_service
+            .as_ref()
+            .context("Database service not initialized")?;
+
+        // Load all publications
+        let all_publications = db.load_publications().await?;
+
+        // Load PubMed records
+        let pubmed_records = db.load_pubmed_records().await?;
+        let pubmed_map: std::collections::HashMap<_, _> = pubmed_records
+            .into_iter()
+            .map(|r| (r.pmid.clone(), r))
+            .collect();
+
+        // Process publications in batches
+        let mut batch_start = 0;
+        while batch_start < all_publications.len() {
+            let batch_end = std::cmp::min(batch_start + chunk_size, all_publications.len());
+            let publications_batch = all_publications[batch_start..batch_end].to_vec();
 
             if publications_batch.is_empty() {
                 break;
@@ -282,20 +301,21 @@ impl IntegrationController {
             }
 
             // Find matches for this batch only
-            let (batch_matches, _) = self.matching_service.find_matches_for_batch(
-                &self.publication_service,
-                &publications_batch,
-                &self.pubmed_records,
-            )?;
+            let (batch_matches, _) = self
+                .matching_service
+                .find_matches(&self.publication_service, &pubmed_map)?;
 
             // Stream results through callback
             callback(PublicationData {
-                publications: publications_batch,
-                matches: batch_matches,
+                publications: publications_batch.clone(),
+                matches: batch_matches
+                    .into_iter()
+                    .map(|m| Match::from_match_result(m))
+                    .collect(), // Convert MatchResult to models::Match using explicit conversion
             })?;
 
             // Prepare for next batch
-            batch_start += publications_batch.len();
+            batch_start = batch_end;
 
             // Clear batch data to free memory
             self.publication_service.clear_batch(&publications_batch);

@@ -215,3 +215,15 @@ impl Checkpoint {
         Ok(checkpoint)
     }
 }
+pub struct Match {
+    pub publication_id: String,
+    pub pmid: String,
+    pub score: f64,
+    pub match_type: MatchType,
+}
+
+pub enum MatchType {
+    Exact,
+    Fuzzy,
+    Partial,
+}

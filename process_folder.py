@@ -136,11 +136,55 @@ class DatabaseManager:
             conn.close()
 
     def clear_temp_tables(self, conn):
-        """Clear temporary tables."""
+        """Clear temporary tables or recreate them if they don't exist."""
         with conn.cursor() as cursor:
-            cursor.execute("TRUNCATE TABLE pubmed_records_temp")
-            cursor.execute("TRUNCATE TABLE pubmed_authors_temp")
-            cursor.execute("TRUNCATE TABLE pubmed_mesh_temp")
+            try:
+                cursor.execute("TRUNCATE TABLE pubmed_records_temp")
+                cursor.execute("TRUNCATE TABLE pubmed_authors_temp")
+                cursor.execute("TRUNCATE TABLE pubmed_mesh_temp")
+            except psycopg2.errors.UndefinedTable:
+                # Tables don't exist yet in this session, create them
+                self.setup_temp_tables(conn)
+            conn.commit()
+
+    def setup_temp_tables(self, conn):
+        """Setup temporary tables for this session."""
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                CREATE TEMP TABLE pubmed_records_temp (
+                    pmid VARCHAR(20),
+                    title TEXT NOT NULL,
+                    title_normalized TEXT,
+                    journal VARCHAR(255),
+                    volume VARCHAR(50),
+                    issue VARCHAR(50),
+                    year INT,
+                    abstract TEXT,
+                    source_file VARCHAR(255)
+                )
+            """
+            )
+
+            cursor.execute(
+                """
+                CREATE TEMP TABLE pubmed_authors_temp (
+                    pmid VARCHAR(20),
+                    author_name TEXT NOT NULL,
+                    position INT
+                )
+            """
+            )
+
+            cursor.execute(
+                """
+                CREATE TEMP TABLE pubmed_mesh_temp (
+                    pmid VARCHAR(20),
+                    mesh_term TEXT NOT NULL
+                )
+            """
+            )
+
             conn.commit()
 
     def merge_temp_tables(self, conn):
@@ -573,6 +617,8 @@ class MatchingProcessor:
 
 
 def main():
+    global MAX_WORKERS  # Add this line to access the global variable
+
     parser = argparse.ArgumentParser(
         description="Process PubMed XML files and match with publications"
     )
@@ -591,14 +637,13 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=MAX_WORKERS,
+        default=MAX_WORKERS,  # Default is taken from global MAX_WORKERS
         help=f"Number of worker processes (default: {MAX_WORKERS})",
     )
 
     args = parser.parse_args()
 
-    # Update constants based on arguments
-    global MAX_WORKERS
+    # Now safely use the argument value to update MAX_WORKERS
     MAX_WORKERS = args.workers
 
     # Configure database connection

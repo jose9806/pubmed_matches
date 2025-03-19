@@ -1,4 +1,3 @@
-# docker-compose.yml with optimized settings
 version: '3.8'
 
 services:
@@ -61,3 +60,6 @@ services:
     depends_on:
       postgres:
         condition: service_healthy
+
+volumes:
+  postgres_data:
