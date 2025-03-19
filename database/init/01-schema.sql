@@ -279,38 +279,17 @@ CREATE TRIGGER update_author_normalized_fields
 BEFORE INSERT OR UPDATE ON authors
 FOR EACH ROW EXECUTE FUNCTION update_author_normalized_fields();
 
-
 -----------------------------------------------------------
--- Persistent temporary tables for bulk processing
+-- NOTE: Temporary Tables for Processing
 -----------------------------------------------------------
-
--- These tables are used by the Python processor for staging data
--- They're structured as regular tables instead of TEMP tables for persistence
-
-CREATE TABLE IF NOT EXISTS pubmed_records_temp (
-    pmid VARCHAR(20),
-    title TEXT NOT NULL,
-    title_normalized TEXT,
-    journal VARCHAR(255),
-    volume VARCHAR(50),
-    issue VARCHAR(50),
-    year INT,
-    abstract TEXT,
-    source_file VARCHAR(255)
-);
-
-CREATE TABLE IF NOT EXISTS pubmed_authors_temp (
-    pmid VARCHAR(20),
-    author_name TEXT NOT NULL,
-    position INT
-);
-
-CREATE TABLE IF NOT EXISTS pubmed_mesh_temp (
-    pmid VARCHAR(20),
-    mesh_term TEXT NOT NULL
-);
-
--- Create indexes to improve bulk loading performance
-CREATE INDEX IF NOT EXISTS idx_pubmed_records_temp_pmid ON pubmed_records_temp(pmid);
-CREATE INDEX IF NOT EXISTS idx_pubmed_authors_temp_pmid ON pubmed_authors_temp(pmid);
-CREATE INDEX IF NOT EXISTS idx_pubmed_mesh_temp_pmid ON pubmed_mesh_temp(pmid);
+-- The following tables are deliberately NOT created in this schema.
+-- They are session-level temporary tables created by the processing
+-- script as needed using CREATE TEMP TABLE commands.
+--
+-- These tables include:
+--   - pubmed_records_temp
+--   - pubmed_authors_temp
+--   - pubmed_mesh_temp
+--
+-- The processing script creates these tables when needed and they exist
+-- only for the duration of the database session.

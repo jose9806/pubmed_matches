@@ -42,6 +42,12 @@ impl PublicationDataService {
             modified: Arc::new(RwLock::new(false)),
         }
     }
+    pub fn clear_batch(&mut self, publications: &[Publication]) {
+        for publication in publications {
+            self.publications.remove(&publication.id);
+            self.normalized_publications.remove(&publication.id);
+        }
+    }
 
     /// Load publications from a CSV file
     pub fn load_from_csv<P: AsRef<Path>>(&mut self, path: P) -> Result<()> {

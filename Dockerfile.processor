@@ -1,5 +1,5 @@
 # Dockerfile.processor - Multi-stage build for smaller, faster containers
-FROM rust:1.71-slim as builder
+FROM rust:latest as builder
 
 WORKDIR /app
 # Install necessary dependencies

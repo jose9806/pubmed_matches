@@ -128,34 +128,16 @@ impl DatabaseService {
         tx: &mut Transaction<'a, Postgres>,
         publications: &[Publication],
     ) -> Result<()> {
-        // Create a temporary table for the batch
-        sqlx::query!(
-            r#"
-            CREATE TEMPORARY TABLE pub_import (
-                id VARCHAR(255) PRIMARY KEY,
-                title TEXT NOT NULL,
-                title_normalized TEXT,
-                person_id VARCHAR(255),
-                author TEXT,
-                author_normalized TEXT,
-                publication_date DATE,
-                year INT,
-                doc_type_id INT,
-                doc_type VARCHAR(100),
-                volume VARCHAR(50),
-                number VARCHAR(50),
-                pages VARCHAR(50)
-            ) ON COMMIT DROP
-            "#
-        )
-        .execute(&mut *tx)
-        .await?;
+        // Clear existing data from the persistent table
+        sqlx::query!(r#"TRUNCATE TABLE pub_import"#)
+            .execute(&mut **tx)
+            .await?;
 
         // Prepare data for insertion
         let mut query_builder = QueryBuilder::new(
-            "INSERT INTO pub_import (id, title, title_normalized, person_id, author, author_normalized, \
-            publication_date, year, doc_type_id, doc_type, volume, number, pages) "
-        );
+        "INSERT INTO pub_import (id, title, title_normalized, person_id, author, author_normalized, \
+        publication_date, year, doc_type_id, doc_type, volume, number, pages) "
+    );
 
         query_builder.push_values(publications, |mut b, pub_record| {
             let title_normalized = normalize_string(&pub_record.title);
@@ -191,37 +173,37 @@ impl DatabaseService {
                 .push_bind(&pub_record.pages);
         });
 
-        // Execute the batch insert to temporary table
-        query_builder.build().execute(&mut *tx).await?;
+        // Execute the batch insert
+        query_builder.build().execute(&mut **tx).await?;
 
-        // Now perform an upsert from the temporary table to the main table
+        // Now perform an upsert from the staging table to the main table
         sqlx::query!(
             r#"
-            INSERT INTO publications (
-                id, title, title_normalized, person_id, author, author_normalized, 
-                publication_date, year, doc_type_id, doc_type, volume, number, pages
-            )
-            SELECT 
-                id, title, title_normalized, person_id, author, author_normalized, 
-                publication_date, year, doc_type_id, doc_type, volume, number, pages
-            FROM pub_import
-            ON CONFLICT (id) DO UPDATE SET
-                title = EXCLUDED.title,
-                title_normalized = EXCLUDED.title_normalized,
-                person_id = EXCLUDED.person_id,
-                author = EXCLUDED.author,
-                author_normalized = EXCLUDED.author_normalized,
-                publication_date = EXCLUDED.publication_date,
-                year = EXCLUDED.year,
-                doc_type_id = EXCLUDED.doc_type_id,
-                doc_type = EXCLUDED.doc_type,
-                volume = EXCLUDED.volume,
-                number = EXCLUDED.number,
-                pages = EXCLUDED.pages,
-                updated_at = NOW()
-            "#
+        INSERT INTO publications (
+            id, title, title_normalized, person_id, author, author_normalized, 
+            publication_date, year, doc_type_id, doc_type, volume, number, pages
         )
-        .execute(&mut *tx)
+        SELECT 
+            id, title, title_normalized, person_id, author, author_normalized, 
+            publication_date, year, doc_type_id, doc_type, volume, number, pages
+        FROM pub_import
+        ON CONFLICT (id) DO UPDATE SET
+            title = EXCLUDED.title,
+            title_normalized = EXCLUDED.title_normalized,
+            person_id = EXCLUDED.person_id,
+            author = EXCLUDED.author,
+            author_normalized = EXCLUDED.author_normalized,
+            publication_date = EXCLUDED.publication_date,
+            year = EXCLUDED.year,
+            doc_type_id = EXCLUDED.doc_type_id,
+            doc_type = EXCLUDED.doc_type,
+            volume = EXCLUDED.volume,
+            number = EXCLUDED.number,
+            pages = EXCLUDED.pages,
+            updated_at = NOW()
+        "#
+        )
+        .execute(&mut **tx)
         .await?;
 
         Ok(())
@@ -508,7 +490,7 @@ impl DatabaseService {
             );
 
             // Execute the batch insert
-            let result = query_builder.build().execute(&mut tx).await;
+            let result = query_builder.build().execute(tx.as_mut()).await;
 
             match result {
                 Ok(result) => {
@@ -583,8 +565,8 @@ impl DatabaseService {
         )
         .fetch(&self.pool);
 
-        // Use a stream to process results without loading everything into memory
-        let publications = stream::iter(enriched)
+        // Process results directly from the stream
+        let publications = enriched
             .map(|row_result| {
                 let row = row_result?;
 
@@ -600,7 +582,7 @@ impl DatabaseService {
                     volume: row.volume,
                     number: row.number,
                     pages: row.pages,
-                    pmid: Some(row.pmid),
+                    pmid: row.pmid,
                     pubmed_authors: row.pubmed_authors,
                     pubmed_abstract: row.pubmed_abstract,
                     pubmed_journal: row.pubmed_journal,

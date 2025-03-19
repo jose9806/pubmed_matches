@@ -221,7 +221,20 @@ pub struct Match {
     pub score: f64,
     pub match_type: MatchType,
 }
-
+impl Match {
+    pub fn from_match_result(result: MatchResult) -> Self {
+        Self {
+            publication_id: result.publication_id,
+            pmid: result.pmid,
+            score: result.match_quality,
+            match_type: match result.match_type.as_str() {
+                "exact_title" => MatchType::Exact,
+                "fuzzy_title" => MatchType::Fuzzy,
+                _ => MatchType::Partial,
+            },
+        }
+    }
+}
 pub enum MatchType {
     Exact,
     Fuzzy,

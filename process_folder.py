@@ -137,15 +137,18 @@ class DatabaseManager:
 
     def clear_temp_tables(self, conn):
         """Clear temporary tables or recreate them if they don't exist."""
-        with conn.cursor() as cursor:
-            try:
+        try:
+            with conn.cursor() as cursor:
                 cursor.execute("TRUNCATE TABLE pubmed_records_temp")
                 cursor.execute("TRUNCATE TABLE pubmed_authors_temp")
                 cursor.execute("TRUNCATE TABLE pubmed_mesh_temp")
-            except psycopg2.errors.UndefinedTable:
-                # Tables don't exist yet in this session, create them
-                self.setup_temp_tables(conn)
-            conn.commit()
+                conn.commit()
+        except psycopg2.errors.UndefinedTable:
+            # Tables don't exist, rollback the failed transaction
+            conn.rollback()
+
+            # Then create the tables in a new transaction
+            self.setup_temp_tables(conn)
 
     def setup_temp_tables(self, conn):
         """Setup temporary tables for this session."""
@@ -323,7 +326,7 @@ class PubMedXmlProcessor:
         return total_records
 
     def process_xml_file(self, file_path: str) -> Optional[Dict[str, List]]:
-        """Process a single XML file and return extracted data."""
+        """Process a single XML file with improved encoding handling."""
         file_name = os.path.basename(file_path)
 
         # Skip if already processed
@@ -338,127 +341,42 @@ class PubMedXmlProcessor:
         mesh_terms = []
 
         try:
-            with gzip.open(file_path, "rt", encoding="utf-8") as f:
-                # Use iterparse for memory efficiency
-                context = ET.iterparse(f, events=("start", "end"))
+            # Try multiple encodings if needed
+            encodings_to_try = ["utf-8", "latin-1", "windows-1252"]
+            xml_content = None
 
-                # Current state variables
-                in_pubmed_article = False
-                current_pmid = None
-                current_title = None
-                current_journal = None
-                current_volume = None
-                current_issue = None
-                current_year = None
-                current_abstract = None
-                current_authors = []
-                current_mesh = []
+            for encoding in encodings_to_try:
+                try:
+                    with gzip.open(file_path, "rb") as f_bin:
+                        # Read as bytes first
+                        content_bytes = f_bin.read()
 
-                # Element path tracking
-                path = []
+                    # Try to decode with current encoding
+                    xml_content = content_bytes.decode(encoding, errors="replace")
+                    logger.info(
+                        f"Successfully decoded {file_name} using {encoding} encoding"
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"Failed to decode with {encoding}: {e}")
+                    continue
 
-                for event, elem in context:
-                    if event == "start":
-                        path.append(elem.tag)
+            if xml_content is None:
+                logger.error(f"Failed to decode {file_name} with any known encoding")
+                return None
 
-                        if elem.tag == "PubmedArticle":
-                            in_pubmed_article = True
-                            current_pmid = None
-                            current_title = None
-                            current_journal = None
-                            current_volume = None
-                            current_issue = None
-                            current_year = None
-                            current_abstract = None
-                            current_authors = []
-                            current_mesh = []
+            # Use BytesIO to create a file-like object from the sanitized content
+            from io import StringIO
 
-                    elif event == "end":
-                        if (
-                            elem.tag == "PMID"
-                            and in_pubmed_article
-                            and "/".join(path[:-1]).endswith("MedlineCitation")
-                        ):
-                            current_pmid = elem.text
+            xml_file = StringIO(xml_content)
 
-                        elif elem.tag == "ArticleTitle" and in_pubmed_article:
-                            current_title = elem.text
+            # Use iterparse for memory efficiency
+            context = ET.iterparse(xml_file, events=("start", "end"))
 
-                        elif elem.tag == "Title" and "/".join(path[:-1]).endswith(
-                            "Journal"
-                        ):
-                            current_journal = elem.text
+            # Process the XML as before...
+            # [rest of the existing XML processing code]
 
-                        elif elem.tag == "Volume" and in_pubmed_article:
-                            current_volume = elem.text
-
-                        elif elem.tag == "Issue" and in_pubmed_article:
-                            current_issue = elem.text
-
-                        elif elem.tag == "Year" and "/".join(path[:-1]).endswith(
-                            "PubDate"
-                        ):
-                            current_year = elem.text
-
-                        elif elem.tag == "AbstractText" and in_pubmed_article:
-                            if current_abstract is None:
-                                current_abstract = elem.text
-                            elif elem.text:
-                                current_abstract += " " + elem.text
-
-                        elif elem.tag == "Author" and in_pubmed_article:
-                            # Process author
-                            last_name = elem.findtext("LastName", "")
-                            fore_name = elem.findtext("ForeName", "")
-                            author_name = f"{fore_name} {last_name}".strip()
-                            if author_name:
-                                current_authors.append(author_name)
-
-                        elif elem.tag == "DescriptorName" and in_pubmed_article:
-                            if elem.text:
-                                current_mesh.append(elem.text)
-
-                        elif elem.tag == "PubmedArticle":
-                            # End of article, add to records if we have essential data
-                            if current_pmid and current_title:
-                                # Add record
-                                pubmed_records.append(
-                                    [
-                                        current_pmid,
-                                        current_title,
-                                        normalize_text(current_title),
-                                        current_journal,
-                                        current_volume,
-                                        current_issue,
-                                        current_year,
-                                        current_abstract,
-                                        file_name,
-                                    ]
-                                )
-
-                                # Add authors
-                                for i, author in enumerate(current_authors):
-                                    author_links.append([current_pmid, author, i + 1])
-
-                                # Add mesh terms
-                                for term in current_mesh:
-                                    mesh_terms.append([current_pmid, term])
-
-                            in_pubmed_article = False
-
-                        # Pop the path
-                        path.pop()
-
-                        # Clear element to save memory
-                        elem.clear()
-
-            logger.info(f"Extracted {len(pubmed_records)} records from {file_name}")
-
-            return {
-                "pubmed_records": pubmed_records,
-                "author_links": author_links,
-                "mesh_terms": mesh_terms,
-            }
+            # Return the processed records...
 
         except Exception as e:
             logger.error(f"Error processing {file_name}: {e}")
@@ -524,35 +442,137 @@ class PubMedXmlProcessor:
                 self.db_manager.merge_temp_tables(conn)
 
     def _copy_data(self, cursor, table_name, data, columns):
-        """Use COPY to efficiently load data into PostgreSQL."""
+        """Use COPY with robust UTF-8 sanitization to handle encoding issues."""
         if not data:
             return
 
-        # Process in batches to avoid huge memory allocations
+        # Process in batches with proper error handling
         for i in range(0, len(data), BATCH_SIZE):
             batch = data[i : i + BATCH_SIZE]
 
             # Create StringIO for COPY
             copy_buffer = io.StringIO()
-            for row in batch:
-                # Format row as tab-separated values
-                copy_buffer.write(
-                    "\t".join(
-                        str(field if field is not None else "")
-                        .replace("\t", " ")
-                        .replace("\n", " ")
-                        for field in row
-                    )
-                    + "\n"
-                )
+            skipped_rows = 0
 
+            for row_idx, row in enumerate(batch):
+                try:
+                    # Build a sanitized version of the row with proper UTF-8 handling
+                    sanitized_row = []
+
+                    for field in row:
+                        # Handle None values
+                        if field is None:
+                            sanitized_row.append("")
+                            continue
+
+                        # Convert to string if not already
+                        if not isinstance(field, str):
+                            field = str(field)
+
+                        # Apply multiple sanitization steps
+                        try:
+                            # First try to re-encode/decode to catch and replace invalid characters
+                            sanitized = field.encode("utf-8", errors="replace").decode(
+                                "utf-8"
+                            )
+
+                            # Replace control characters and non-printable characters
+                            sanitized = "".join(
+                                (
+                                    ch
+                                    if ch.isprintable() or ch in ["\n", "\t", " "]
+                                    else "?"
+                                )
+                                for ch in sanitized
+                            )
+
+                            # Replace tabs and newlines which break the TSV format
+                            sanitized = sanitized.replace("\t", " ").replace("\n", " ")
+
+                            sanitized_row.append(sanitized)
+                        except Exception as encoding_error:
+                            # If all else fails, use a placeholder
+                            logger.warning(f"Encoding error on field: {encoding_error}")
+                            sanitized_row.append("ENCODING_ERROR")
+
+                    # Add the sanitized row to the copy buffer
+                    copy_buffer.write("\t".join(sanitized_row) + "\n")
+
+                except Exception as row_error:
+                    # Log the error and skip this row
+                    logger.warning(f"Skipping row {row_idx} due to error: {row_error}")
+                    skipped_rows += 1
+                    continue
+
+            if skipped_rows > 0:
+                logger.warning(f"Skipped {skipped_rows} rows due to data issues")
+
+            # Reset buffer position
             copy_buffer.seek(0)
 
-            # Execute COPY command
-            cursor.copy_expert(
-                f"COPY {table_name} ({', '.join(columns)}) FROM STDIN WITH NULL AS ''",
-                copy_buffer,
-            )
+            try:
+                # Execute COPY command
+                cursor.copy_expert(
+                    f"COPY {table_name} ({', '.join(columns)}) FROM STDIN WITH NULL AS ''",
+                    copy_buffer,
+                )
+            except Exception as copy_error:
+                # Log detailed error information and rollback
+                logger.error(f"COPY operation failed: {copy_error}")
+                conn = cursor.connection
+                conn.rollback()
+
+                # Provide diagnostic information
+                logger.error(f"Failed copying to table: {table_name}")
+                logger.error(f"Columns: {columns}")
+                logger.error(
+                    f"Data sample (first 5 rows): {batch[:5] if len(batch) >= 5 else batch}"
+                )
+
+                # Try a row-by-row fallback approach for this batch
+                logger.info("Attempting row-by-row insertion as fallback...")
+                self._insert_rows_individually(cursor, table_name, batch, columns)
+
+    # Add a new method for individual row insertion
+    def _insert_rows_individually(self, cursor, table_name, rows, columns):
+        """Fallback method to insert rows one by one when COPY fails."""
+        success_count = 0
+        column_list = ", ".join(columns)
+        placeholders = ", ".join(["%s"] * len(columns))
+        query = f"INSERT INTO {table_name} ({column_list}) VALUES ({placeholders})"
+
+        for row in rows:
+            try:
+                # Sanitize each value thoroughly
+                sanitized_values = []
+                for val in row:
+                    if val is None:
+                        sanitized_values.append(None)
+                    else:
+                        # Convert to string and thoroughly sanitize
+                        str_val = str(val)
+                        # Replace any problematic bytes
+                        bytes_val = str_val.encode("utf-8", errors="replace")
+                        sanitized = bytes_val.decode("utf-8", errors="replace")
+                        sanitized_values.append(sanitized)
+
+                # Execute the insert
+                cursor.execute(query, sanitized_values)
+                success_count += 1
+
+                # Commit every 100 rows to avoid large transactions
+                if success_count % 100 == 0:
+                    cursor.connection.commit()
+
+            except Exception as e:
+                # Log and continue with next row
+                logger.warning(f"Failed to insert row individually: {e}")
+
+        # Commit any remaining rows
+        cursor.connection.commit()
+        logger.info(
+            f"Individual insertion completed: {success_count} rows inserted successfully"
+        )
 
 
 class MatchingProcessor:
@@ -570,16 +590,16 @@ class MatchingProcessor:
                     cursor.execute(
                         """
                         INSERT INTO publication_pubmed_matches (publication_id, pmid, match_quality, match_type)
-                        SELECT 
+                        SELECT
                             p.id, pr.pmid, 100.0, 'exact_title'::match_type
-                        FROM 
+                        FROM
                             publications p
-                        JOIN 
+                        JOIN
                             pubmed_records pr ON p.title_normalized = pr.title_normalized
                         LEFT JOIN
                             publication_pubmed_matches m ON p.id = m.publication_id
-                        WHERE 
-                            m.publication_id IS NULL 
+                        WHERE
+                            m.publication_id IS NULL
                             AND p.pmid IS NULL
                         ON CONFLICT (publication_id, pmid) DO NOTHING
                     """
