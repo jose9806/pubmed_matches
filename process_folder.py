@@ -326,7 +326,7 @@ class PubMedXmlProcessor:
         return total_records
 
     def process_xml_file(self, file_path: str) -> Optional[Dict[str, List]]:
-        """Process a single XML file with improved encoding handling."""
+        """Process a single XML file and return extracted data."""
         file_name = os.path.basename(file_path)
 
         # Skip if already processed
@@ -341,42 +341,127 @@ class PubMedXmlProcessor:
         mesh_terms = []
 
         try:
-            # Try multiple encodings if needed
-            encodings_to_try = ["utf-8", "latin-1", "windows-1252"]
-            xml_content = None
+            with gzip.open(file_path, "rt", encoding="utf-8") as f:
+                # Use iterparse for memory efficiency
+                context = ET.iterparse(f, events=("start", "end"))
 
-            for encoding in encodings_to_try:
-                try:
-                    with gzip.open(file_path, "rb") as f_bin:
-                        # Read as bytes first
-                        content_bytes = f_bin.read()
+                # Current state variables
+                in_pubmed_article = False
+                current_pmid = None
+                current_title = None
+                current_journal = None
+                current_volume = None
+                current_issue = None
+                current_year = None
+                current_abstract = None
+                current_authors = []
+                current_mesh = []
 
-                    # Try to decode with current encoding
-                    xml_content = content_bytes.decode(encoding, errors="replace")
-                    logger.info(
-                        f"Successfully decoded {file_name} using {encoding} encoding"
-                    )
-                    break
-                except Exception as e:
-                    logger.warning(f"Failed to decode with {encoding}: {e}")
-                    continue
+                # Element path tracking
+                path = []
 
-            if xml_content is None:
-                logger.error(f"Failed to decode {file_name} with any known encoding")
-                return None
+                for event, elem in context:
+                    if event == "start":
+                        path.append(elem.tag)
 
-            # Use BytesIO to create a file-like object from the sanitized content
-            from io import StringIO
+                        if elem.tag == "PubmedArticle":
+                            in_pubmed_article = True
+                            current_pmid = None
+                            current_title = None
+                            current_journal = None
+                            current_volume = None
+                            current_issue = None
+                            current_year = None
+                            current_abstract = None
+                            current_authors = []
+                            current_mesh = []
 
-            xml_file = StringIO(xml_content)
+                    elif event == "end":
+                        if (
+                            elem.tag == "PMID"
+                            and in_pubmed_article
+                            and "/".join(path[:-1]).endswith("MedlineCitation")
+                        ):
+                            current_pmid = elem.text
 
-            # Use iterparse for memory efficiency
-            context = ET.iterparse(xml_file, events=("start", "end"))
+                        elif elem.tag == "ArticleTitle" and in_pubmed_article:
+                            current_title = elem.text
 
-            # Process the XML as before...
-            # [rest of the existing XML processing code]
+                        elif elem.tag == "Title" and "/".join(path[:-1]).endswith(
+                            "Journal"
+                        ):
+                            current_journal = elem.text
 
-            # Return the processed records...
+                        elif elem.tag == "Volume" and in_pubmed_article:
+                            current_volume = elem.text
+
+                        elif elem.tag == "Issue" and in_pubmed_article:
+                            current_issue = elem.text
+
+                        elif elem.tag == "Year" and "/".join(path[:-1]).endswith(
+                            "PubDate"
+                        ):
+                            current_year = elem.text
+
+                        elif elem.tag == "AbstractText" and in_pubmed_article:
+                            if current_abstract is None:
+                                current_abstract = elem.text
+                            elif elem.text:
+                                current_abstract += " " + elem.text
+
+                        elif elem.tag == "Author" and in_pubmed_article:
+                            # Process author
+                            last_name = elem.findtext("LastName", "")
+                            fore_name = elem.findtext("ForeName", "")
+                            author_name = f"{fore_name} {last_name}".strip()
+                            if author_name:
+                                current_authors.append(author_name)
+
+                        elif elem.tag == "DescriptorName" and in_pubmed_article:
+                            if elem.text:
+                                current_mesh.append(elem.text)
+
+                        elif elem.tag == "PubmedArticle":
+                            # End of article, add to records if we have essential data
+                            if current_pmid and current_title:
+                                # Add record
+                                pubmed_records.append(
+                                    [
+                                        current_pmid,
+                                        current_title,
+                                        normalize_text(current_title),
+                                        current_journal,
+                                        current_volume,
+                                        current_issue,
+                                        current_year,
+                                        current_abstract,
+                                        file_name,
+                                    ]
+                                )
+
+                                # Add authors
+                                for i, author in enumerate(current_authors):
+                                    author_links.append([current_pmid, author, i + 1])
+
+                                # Add mesh terms
+                                for term in current_mesh:
+                                    mesh_terms.append([current_pmid, term])
+
+                            in_pubmed_article = False
+
+                        # Pop the path
+                        path.pop()
+
+                        # Clear element to save memory
+                        elem.clear()
+
+            logger.info(f"Extracted {len(pubmed_records)} records from {file_name}")
+
+            return {
+                "pubmed_records": pubmed_records,
+                "author_links": author_links,
+                "mesh_terms": mesh_terms,
+            }
 
         except Exception as e:
             logger.error(f"Error processing {file_name}: {e}")
@@ -600,14 +685,17 @@ class MatchingProcessor:
                             publication_pubmed_matches m ON p.id = m.publication_id
                         WHERE
                             m.publication_id IS NULL
-                            AND p.pmid IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM publication_pubmed_matches 
+                                WHERE publication_id = p.id
+                            )
                         ON CONFLICT (publication_id, pmid) DO NOTHING
-                    """
+                        """
                     )
                     exact_matches = cursor.rowcount
                     logger.info(f"Created {exact_matches} exact title matches")
 
-                    # Create fuzzy title + year matches
+                    # Similar modification for the title+year matches query
                     cursor.execute(
                         """
                         INSERT INTO publication_pubmed_matches (publication_id, pmid, match_quality, match_type)
@@ -624,16 +712,13 @@ class MatchingProcessor:
                             publication_pubmed_matches m ON p.id = m.publication_id
                         WHERE 
                             m.publication_id IS NULL 
-                            AND p.pmid IS NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM publication_pubmed_matches 
+                                WHERE publication_id = p.id
+                            )
                         ON CONFLICT (publication_id, pmid) DO NOTHING
-                    """
+                        """
                     )
-                    year_matches = cursor.rowcount
-                    logger.info(f"Created {year_matches} title+year matches")
-
-                    conn.commit()
-
-                    return exact_matches + year_matches
 
 
 def main():
