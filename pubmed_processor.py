@@ -88,14 +88,28 @@ class PubMedRecord:
     title: str
     title_normalized: str
     journal: str = ""
+    journal_iso: str = ""
     issn: str = ""
+    issn_type: str = ""
+    issn_linking: str = ""
     volume: str = ""
     issue: str = ""
+    pagination: str = ""
+    doi: str = ""
     pub_date: str = ""
     year: Optional[int] = None
+    pub_status: str = ""
+    language: str = ""
+    vernacular_title: str = ""
+    medline_ta: str = ""
+    nlm_unique_id: str = ""
+    country: str = ""
     abstract: str = ""
     authors: List[Tuple[str, int]] = None
     mesh_terms: List[str] = None
+    chemicals: List[str] = None
+    keywords: List[str] = None
+    publication_types: List[str] = None
     source_file: str = ""
 
     def __post_init__(self):
@@ -103,17 +117,27 @@ class PubMedRecord:
             self.authors = []
         if self.mesh_terms is None:
             self.mesh_terms = []
+        if self.chemicals is None:
+            self.chemicals = []
+        if self.keywords is None:
+            self.keywords = []
+        if self.publication_types is None:
+            self.publication_types = []
 
 
 # ========================= DATABASE MANAGEMENT =========================
 
 
 class DatabaseManager:
+    """Manages database operations for PubMed record processing."""
+
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.conn = None
+        self.temp_tables_created = False
 
     def connect(self):
+        """Establish connection to the database with optimized settings."""
         if self.conn is None or self.conn.closed:
             self.conn = psycopg2.connect(
                 **self.config,
@@ -127,64 +151,191 @@ class DatabaseManager:
         return self.conn
 
     def close(self):
+        """Close the database connection."""
         if self.conn and not self.conn.closed:
             self.conn.close()
             self.conn = None
 
+    def validate_schema(self):
+        """Validate the database schema and report any missing columns."""
+        conn = self.connect()
+        with conn.cursor() as cursor:
+            try:
+                # Check if pubmed_records table has all required columns
+                cursor.execute(
+                    """
+                    SELECT column_name FROM information_schema.columns 
+                    WHERE table_name = 'pubmed_records'
+                """
+                )
+                existing_columns = {row[0] for row in cursor.fetchall()}
+
+                # Define expected columns based on our schema
+                expected_columns = {
+                    "pmid",
+                    "title",
+                    "title_normalized",
+                    "journal",
+                    "journal_iso",
+                    "issn",
+                    "issn_linking",
+                    "issn_type",
+                    "volume",
+                    "issue",
+                    "pagination",
+                    "doi",
+                    "year",
+                    "pub_date",
+                    "pub_status",
+                    "language",
+                    "vernacular_title",
+                    "abstract",
+                    "medline_ta",
+                    "nlm_unique_id",
+                    "country",
+                    "processed_at",
+                    "source_file",
+                }
+
+                missing_columns = expected_columns - existing_columns
+                if missing_columns:
+                    logger.warning(
+                        f"Schema validation: Missing columns in pubmed_records: {missing_columns}"
+                    )
+                    return False
+                return True
+            except Exception as e:
+                logger.error(f"Schema validation error: {e}")
+                return False
+
+    def create_temp_tables(self):
+        """Create temporary tables that match our permanent schema."""
+        conn = self.connect()
+        with conn.cursor() as cursor:
+            try:
+                # Create temporary table for pubmed records
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_records (
+                    pmid VARCHAR(20) NOT NULL,
+                    title TEXT NOT NULL,
+                    title_normalized TEXT NOT NULL,
+                    journal VARCHAR(255),
+                    journal_iso VARCHAR(100),
+                    issn VARCHAR(20),
+                    issn_linking VARCHAR(20),
+                    issn_type VARCHAR(20),
+                    volume VARCHAR(50),
+                    issue VARCHAR(50),
+                    pagination VARCHAR(50),
+                    doi VARCHAR(100),
+                    year INT,
+                    pub_date VARCHAR(100),
+                    pub_status VARCHAR(50),
+                    language VARCHAR(50),
+                    vernacular_title TEXT,
+                    medline_ta VARCHAR(255),
+                    nlm_unique_id VARCHAR(100),
+                    country VARCHAR(100),
+                    abstract TEXT,
+                    source_file VARCHAR(255)
+                )
+                """
+                )
+
+                # Create temporary table for authors
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_authors (
+                    pmid VARCHAR(20) NOT NULL,
+                    author_name TEXT NOT NULL,
+                    position INT NOT NULL
+                )
+                """
+                )
+
+                # Create temporary table for mesh terms
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_mesh (
+                    pmid VARCHAR(20) NOT NULL,
+                    mesh_term TEXT NOT NULL
+                )
+                """
+                )
+
+                # Create temporary table for chemicals
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_chemicals (
+                    pmid VARCHAR(20) NOT NULL,
+                    chemical_name TEXT NOT NULL
+                )
+                """
+                )
+
+                # Create temporary table for keywords
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_keywords (
+                    pmid VARCHAR(20) NOT NULL,
+                    keyword TEXT NOT NULL
+                )
+                """
+                )
+
+                # Create temporary table for publication types
+                cursor.execute(
+                    """
+                CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_publication_types (
+                    pmid VARCHAR(20) NOT NULL,
+                    publication_type TEXT NOT NULL
+                )
+                """
+                )
+
+                self.temp_tables_created = True
+                logger.info("Temporary tables created successfully")
+            except Exception as e:
+                logger.error(f"Error creating temporary tables: {e}")
+                conn.rollback()
+                raise
+
     def clear_temp_tables(self):
+        """Truncate all temporary tables to prepare for a new batch."""
+        if not self.temp_tables_created:
+            self.create_temp_tables()
+            return
+
         conn = self.connect()
         with conn.cursor() as cursor:
             try:
                 cursor.execute("TRUNCATE TABLE temp_pubmed_records")
                 cursor.execute("TRUNCATE TABLE temp_pubmed_authors")
                 cursor.execute("TRUNCATE TABLE temp_pubmed_mesh")
-            except psycopg2.Error:
+                cursor.execute("TRUNCATE TABLE temp_pubmed_chemicals")
+                cursor.execute("TRUNCATE TABLE temp_pubmed_keywords")
+                cursor.execute("TRUNCATE TABLE temp_pubmed_publication_types")
+                logger.info("Temporary tables truncated")
+            except psycopg2.Error as e:
+                logger.error(f"Error truncating temp tables: {e}")
                 conn.rollback()
-                self._create_temp_tables(cursor)
-
-    def _create_temp_tables(self, cursor):
-        cursor.execute(
-            """
-            CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_records (
-                pmid VARCHAR(20) NOT NULL,
-                title TEXT NOT NULL,
-                title_normalized TEXT NOT NULL,
-                journal VARCHAR(255),
-                issn VARCHAR(20),
-                volume VARCHAR(50),
-                issue VARCHAR(50),
-                pub_date VARCHAR(100),
-                year INT,
-                abstract TEXT,
-                source_file VARCHAR(255)
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_authors (
-                pmid VARCHAR(20) NOT NULL,
-                author_name TEXT NOT NULL,
-                position INT NOT NULL
-            )
-            """
-        )
-        cursor.execute(
-            """
-            CREATE TEMPORARY TABLE IF NOT EXISTS temp_pubmed_mesh (
-                pmid VARCHAR(20) NOT NULL,
-                mesh_term TEXT NOT NULL
-            )
-            """
-        )
+                self.create_temp_tables()
 
     def bulk_insert_records(self, records: List[PubMedRecord]) -> int:
+        """Insert a batch of PubMed records into the database."""
         if not records:
             return 0
 
         conn = self.connect()
-        self.clear_temp_tables()
 
+        # Validate and create temp tables if needed
+        if not self.temp_tables_created:
+            self.create_temp_tables()
+        else:
+            self.clear_temp_tables()
+
+        # Deduplicate records by PMID
         unique_records = {}
         for record in records:
             unique_records[record.pmid] = record
@@ -199,42 +350,138 @@ class DatabaseManager:
             pubmed_rows = []
             author_rows = []
             mesh_rows = []
+            chemical_rows = []
+            keyword_rows = []
+            publication_type_rows = []
 
+            # Prepare data for bulk insert
             for record in deduplicated_records:
+                # Format public date for database if it's not already in the right format
+                pub_date = record.pub_date
+
+                # Prepare main record data
                 pubmed_rows.append(
                     (
                         record.pmid,
                         record.title,
                         record.title_normalized,
                         record.journal,
-                        record.issn,
-                        record.volume,
-                        record.issue,
-                        record.pub_date,
+                        getattr(record, "journal_iso", ""),
+                        getattr(record, "issn", ""),
+                        getattr(record, "issn_linking", ""),
+                        getattr(record, "issn_type", ""),
+                        getattr(record, "volume", ""),
+                        getattr(record, "issue", ""),
+                        getattr(record, "pagination", ""),
+                        getattr(record, "doi", ""),
                         record.year,
+                        pub_date,
+                        getattr(record, "pub_status", ""),
+                        getattr(record, "language", ""),
+                        getattr(record, "vernacular_title", ""),
+                        getattr(record, "medline_ta", ""),
+                        getattr(record, "nlm_unique_id", ""),
+                        getattr(record, "country", ""),
                         record.abstract,
                         record.source_file,
                     )
                 )
+
+                # Prepare author data
                 for author_name, position in record.authors:
-                    author_rows.append((record.pmid, author_name, position))
+                    if author_name and author_name.strip():
+                        author_rows.append((record.pmid, author_name, position))
+
+                # Prepare mesh term data
                 for mesh_term in record.mesh_terms:
-                    mesh_rows.append((record.pmid, mesh_term))
+                    if mesh_term and mesh_term.strip():
+                        mesh_rows.append((record.pmid, mesh_term))
+
+                # Handle other reference data if available
+                if hasattr(record, "chemicals") and record.chemicals:
+                    for chemical in record.chemicals:
+                        chemical_rows.append((record.pmid, chemical))
+
+                if hasattr(record, "keywords") and record.keywords:
+                    for keyword in record.keywords:
+                        keyword_rows.append((record.pmid, keyword))
+
+                if hasattr(record, "publication_types") and record.publication_types:
+                    for pub_type in record.publication_types:
+                        publication_type_rows.append((record.pmid, pub_type))
 
             try:
+                # Log batch statistics for debugging
+                logger.info(
+                    f"Inserting batch: {len(pubmed_rows)} records, {len(author_rows)} authors, {len(mesh_rows)} mesh terms"
+                )
+                if not author_rows:
+                    logger.warning("No author data found in this batch!")
+                    # Debug the first few records to see if they have authors
+                    for i, record in enumerate(deduplicated_records[:3]):
+                        logger.warning(
+                            f"Record {i} (PMID: {record.pmid}) has {len(record.authors)} authors"
+                        )
+
+                # Perform bulk inserts
                 self._copy_records(cursor, "temp_pubmed_records", pubmed_rows)
-                self._copy_records(cursor, "temp_pubmed_authors", author_rows)
-                self._copy_records(cursor, "temp_pubmed_mesh", mesh_rows)
+                if author_rows:
+                    self._copy_records(cursor, "temp_pubmed_authors", author_rows)
+                if mesh_rows:
+                    self._copy_records(cursor, "temp_pubmed_mesh", mesh_rows)
+                if chemical_rows:
+                    self._copy_records(cursor, "temp_pubmed_chemicals", chemical_rows)
+                if keyword_rows:
+                    self._copy_records(cursor, "temp_pubmed_keywords", keyword_rows)
+                if publication_type_rows:
+                    self._copy_records(
+                        cursor, "temp_pubmed_publication_types", publication_type_rows
+                    )
+
+                # Merge data from temp tables to permanent tables
                 self._merge_temp_data(cursor)
                 total_records = len(pubmed_rows)
+
+                # Verify insertion success
+                cursor.execute(
+                    "SELECT COUNT(*) FROM pubmed_records WHERE pmid = ANY(%s)",
+                    ([r.pmid for r in deduplicated_records],),
+                )
+                inserted_count = cursor.fetchone()[0]
+                logger.info(
+                    f"Verification: {inserted_count}/{len(deduplicated_records)} records in database"
+                )
+
+                if author_rows:
+                    # Check author insertion
+                    sample_pmids = [
+                        author_rows[i][0] for i in range(min(5, len(author_rows)))
+                    ]
+                    cursor.execute(
+                        """
+                        SELECT COUNT(*) FROM pubmed_authors pa 
+                        JOIN authors a ON pa.author_id = a.id
+                        WHERE pa.pubmed_id = ANY(%s)
+                    """,
+                        (sample_pmids,),
+                    )
+                    author_count = cursor.fetchone()[0]
+                    logger.info(
+                        f"Verification: Found {author_count} authors for {len(sample_pmids)} sample PMIDs"
+                    )
+
             except Exception as e:
                 logger.error(f"Database error during bulk insert: {e}")
+                logger.error(f"Error type: {type(e).__name__}")
+                if isinstance(e, psycopg2.Error):
+                    logger.error(f"SQL State: {e.pgcode}, Message: {e.pgerror}")
                 conn.rollback()
                 raise
 
             return total_records
 
     def _copy_records(self, cursor, table_name: str, rows: List[Tuple]) -> None:
+        """Use PostgreSQL COPY for efficient bulk data loading."""
         if not rows:
             return
 
@@ -247,6 +494,7 @@ class DatabaseManager:
                 if item is None:
                     line.append("")
                 elif isinstance(item, str):
+                    # Handle special characters for PostgreSQL COPY
                     escaped = (
                         item.replace("\\", "\\\\")
                         .replace("\t", "\\t")
@@ -257,179 +505,416 @@ class DatabaseManager:
                 else:
                     line.append(str(item))
             buffer.write("\t".join(line) + "\n")
+
         buffer.seek(0)
-        cursor.copy_expert(f"COPY {table_name} FROM STDIN WITH NULL AS ''", buffer)
+        try:
+            cursor.copy_expert(f"COPY {table_name} FROM STDIN WITH NULL AS ''", buffer)
+            logger.debug(f"Copied {len(rows)} rows to {table_name}")
+        except Exception as e:
+            logger.error(f"Error during COPY to {table_name}: {e}")
+            # For debugging, show a sample of problematic data
+            if len(rows) > 0:
+                logger.error(f"Sample data (first row): {rows[0]}")
+            raise
 
     def _merge_temp_data(self, cursor) -> None:
-        cursor.execute(
-            """
-            INSERT INTO pubmed_records (
-                pmid, title, title_normalized, journal, issn, volume, issue, 
-                year, abstract, processed_at, source_file
+        """Merge data from temporary tables into permanent tables."""
+        try:
+            # First de-duplicate the temporary table to avoid the constraint violation
+            cursor.execute(
+                """
+                CREATE TEMPORARY TABLE temp_pubmed_records_dedup AS
+                SELECT DISTINCT ON (pmid) 
+                    pmid, title, title_normalized, journal, journal_iso, issn, issn_linking,
+                    issn_type, volume, issue, pagination, doi, year, pub_date, pub_status,
+                    language, vernacular_title, medline_ta, nlm_unique_id, country,
+                    abstract, source_file
+                FROM temp_pubmed_records
+                ORDER BY pmid, (LENGTH(title) + LENGTH(abstract)) DESC
+                """
             )
-            SELECT 
-                pmid, title, title_normalized, journal, issn, volume, issue,
-                year, abstract, NOW(), source_file
-            FROM temp_pubmed_records
-            ON CONFLICT (pmid) DO UPDATE SET
-                title = EXCLUDED.title,
-                title_normalized = EXCLUDED.title_normalized,
-                journal = EXCLUDED.journal,
-                issn = EXCLUDED.issn,
-                volume = EXCLUDED.volume, 
-                issue = EXCLUDED.issue,
-                year = EXCLUDED.year,
-                abstract = EXCLUDED.abstract,
-                processed_at = NOW(),
-                source_file = EXCLUDED.source_file
+
+            # Replace the original temp table with the de-duplicated version
+            cursor.execute("DROP TABLE temp_pubmed_records")
+            cursor.execute(
+                "ALTER TABLE temp_pubmed_records_dedup RENAME TO temp_pubmed_records"
+            )
+
+            # 1. Insert main PubMed records
+            cursor.execute(
+                """
+                INSERT INTO pubmed_records (
+                    pmid, title, title_normalized, journal, journal_iso, issn, issn_linking,
+                    issn_type, volume, issue, pagination, doi, year, pub_date, pub_status,
+                    language, vernacular_title, medline_ta, nlm_unique_id, country,
+                    abstract, processed_at, source_file
+                )
+                SELECT 
+                    pmid, title, title_normalized, journal, journal_iso, issn, issn_linking,
+                    issn_type, volume, issue, pagination, doi, year, 
+                    CASE WHEN pub_date ~ '^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$' THEN pub_date::DATE
+                        WHEN pub_date ~ '^[0-9]{4}-[0-9]{1,2}$' THEN (pub_date || '-01')::DATE
+                        WHEN pub_date ~ '^[0-9]{4}$' THEN (pub_date || '-01-01')::DATE
+                        ELSE NULL
+                    END as pub_date,
+                    pub_status, language, vernacular_title, medline_ta, nlm_unique_id, country,
+                    abstract, NOW(), source_file
+                FROM temp_pubmed_records
+                ON CONFLICT (pmid) DO UPDATE SET
+                    title = EXCLUDED.title,
+                    title_normalized = EXCLUDED.title_normalized,
+                    journal = EXCLUDED.journal,
+                    journal_iso = EXCLUDED.journal_iso,
+                    issn = EXCLUDED.issn,
+                    issn_linking = EXCLUDED.issn_linking,
+                    issn_type = EXCLUDED.issn_type,
+                    volume = EXCLUDED.volume, 
+                    issue = EXCLUDED.issue,
+                    pagination = EXCLUDED.pagination,
+                    doi = EXCLUDED.doi,
+                    year = EXCLUDED.year,
+                    pub_date = EXCLUDED.pub_date,
+                    pub_status = EXCLUDED.pub_status,
+                    language = EXCLUDED.language,
+                    vernacular_title = EXCLUDED.vernacular_title,
+                    medline_ta = EXCLUDED.medline_ta,
+                    nlm_unique_id = EXCLUDED.nlm_unique_id,
+                    country = EXCLUDED.country,
+                    abstract = EXCLUDED.abstract,
+                    processed_at = NOW(),
+                    source_file = EXCLUDED.source_file
+                """
+            )
+            logger.info(f"Merged {cursor.rowcount} records into pubmed_records table")
+
+            # De-duplicate the other temporary tables as well before merging
+            self._deduplicate_relations_table(
+                cursor, "temp_pubmed_authors", ["pmid", "author_name"]
+            )
+            self._deduplicate_relations_table(
+                cursor, "temp_pubmed_mesh", ["pmid", "mesh_term"]
+            )
+            self._deduplicate_relations_table(
+                cursor, "temp_pubmed_chemicals", ["pmid", "chemical_name"]
+            )
+            self._deduplicate_relations_table(
+                cursor, "temp_pubmed_keywords", ["pmid", "keyword"]
+            )
+            self._deduplicate_relations_table(
+                cursor, "temp_pubmed_publication_types", ["pmid", "publication_type"]
+            )
+
+            # 2. Insert authors and link to PubMed records
+            # - First insert unique authors with ON CONFLICT DO NOTHING
+            cursor.execute(
+                """
+                INSERT INTO authors (name, name_normalized)
+                SELECT DISTINCT author_name, normalize_text(author_name)
+                FROM temp_pubmed_authors
+                ON CONFLICT (name) DO NOTHING
+                """
+            )
+            author_insert_count = cursor.rowcount
+            logger.info(f"Inserted {author_insert_count} new unique authors")
+
+            # - Then link authors to PubMed records
+            cursor.execute(
+                """
+                INSERT INTO pubmed_authors (pubmed_id, author_id, position)
+                SELECT 
+                    t.pmid, a.id, t.position
+                FROM temp_pubmed_authors t
+                JOIN authors a ON t.author_name = a.name
+                ON CONFLICT (pubmed_id, author_id) DO UPDATE SET
+                    position = EXCLUDED.position
+                """
+            )
+            author_link_count = cursor.rowcount
+            logger.info(f"Linked {author_link_count} authors to PubMed records")
+
+            # 3. Insert MeSH terms and link to PubMed records
+            cursor.execute(
+                """
+                INSERT INTO mesh_terms (term)
+                SELECT DISTINCT mesh_term
+                FROM temp_pubmed_mesh
+                ON CONFLICT (term) DO NOTHING
+                """
+            )
+
+            cursor.execute(
+                """
+                INSERT INTO pubmed_mesh_terms (pubmed_id, mesh_id)
+                SELECT 
+                    t.pmid, m.id
+                FROM temp_pubmed_mesh t
+                JOIN mesh_terms m ON t.mesh_term = m.term
+                ON CONFLICT (pubmed_id, mesh_id) DO NOTHING
+                """
+            )
+
+            # 4. Handle chemicals if present
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO chemicals (name)
+                    SELECT DISTINCT chemical_name
+                    FROM temp_pubmed_chemicals
+                    ON CONFLICT (name) DO NOTHING
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO pubmed_chemicals (pubmed_id, chemical_id)
+                    SELECT 
+                        t.pmid, c.id
+                    FROM temp_pubmed_chemicals t
+                    JOIN chemicals c ON t.chemical_name = c.name
+                    ON CONFLICT (pubmed_id, chemical_id) DO NOTHING
+                    """
+                )
+            except Exception as e:
+                logger.warning(f"Chemical data insertion skipped: {e}")
+
+            # 5. Handle keywords if present
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO keywords (keyword)
+                    SELECT DISTINCT keyword
+                    FROM temp_pubmed_keywords
+                    ON CONFLICT (keyword) DO NOTHING
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO pubmed_keywords (pubmed_id, keyword_id)
+                    SELECT 
+                        t.pmid, k.id
+                    FROM temp_pubmed_keywords t
+                    JOIN keywords k ON t.keyword = k.keyword
+                    ON CONFLICT (pubmed_id, keyword_id) DO NOTHING
+                    """
+                )
+            except Exception as e:
+                logger.warning(f"Keyword data insertion skipped: {e}")
+
+            # 6. Handle publication types if present
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO publication_types (type)
+                    SELECT DISTINCT publication_type
+                    FROM temp_pubmed_publication_types
+                    ON CONFLICT (type) DO NOTHING
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    INSERT INTO pubmed_publication_types (pubmed_id, type_id)
+                    SELECT 
+                        t.pmid, pt.id
+                    FROM temp_pubmed_publication_types t
+                    JOIN publication_types pt ON t.publication_type = pt.type
+                    ON CONFLICT (pubmed_id, type_id) DO NOTHING
+                    """
+                )
+            except Exception as e:
+                logger.warning(f"Publication type data insertion skipped: {e}")
+
+        except Exception as e:
+            logger.error(f"Error during temp data merge: {e}")
+            if isinstance(e, psycopg2.Error):
+                logger.error(f"SQL State: {e.pgcode}, Message: {e.pgerror}")
+            raise
+
+    def _deduplicate_relations_table(self, cursor, table_name, unique_columns):
+        """De-duplicates a temporary relation table based on the specified unique columns."""
+        try:
+            # Create column list for the query
+            column_list = ", ".join(unique_columns)
+
+            # Create the deduplication query
+            dedup_table = f"{table_name}_dedup"
+            cursor.execute(
+                f"""
+                CREATE TEMPORARY TABLE {dedup_table} AS
+                SELECT DISTINCT ON ({column_list}) *
+                FROM {table_name}
             """
-        )
-        cursor.execute(
-            """
-            INSERT INTO authors (name, name_normalized)
-            SELECT DISTINCT author_name, normalize_text(author_name)
-            FROM temp_pubmed_authors
-            ON CONFLICT (name) DO NOTHING
-            """
-        )
-        cursor.execute(
-            """
-            INSERT INTO mesh_terms (term)
-            SELECT DISTINCT mesh_term
-            FROM temp_pubmed_mesh
-            ON CONFLICT (term) DO NOTHING
-            """
-        )
-        cursor.execute(
-            """
-            INSERT INTO pubmed_authors (pubmed_id, author_id, position)
-            SELECT 
-                t.pmid, a.id, t.position
-            FROM temp_pubmed_authors t
-            JOIN authors a ON t.author_name = a.name
-            ON CONFLICT (pubmed_id, author_id) DO UPDATE SET
-                position = EXCLUDED.position
-            """
-        )
-        cursor.execute(
-            """
-            INSERT INTO pubmed_mesh_terms (pubmed_id, mesh_id)
-            SELECT 
-                t.pmid, m.id
-            FROM temp_pubmed_mesh t
-            JOIN mesh_terms m ON t.mesh_term = m.term
-            ON CONFLICT (pubmed_id, mesh_id) DO NOTHING
-            """
-        )
+            )
+
+            # Replace the original table with the deduplicated one
+            cursor.execute(f"DROP TABLE {table_name}")
+            cursor.execute(f"ALTER TABLE {dedup_table} RENAME TO {table_name}")
+
+        except Exception as e:
+            logger.warning(f"Error deduplicating {table_name}: {e}")
 
 
 # ========================= XML PROCESSING =========================
 
 
 def parse_xml_file(file_path: str) -> List[PubMedRecord]:
-    """Función de nivel superior para procesar un archivo XML comprimido."""
     records = []
     filename = os.path.basename(file_path)
-    logger.info(f"Processing {filename}")
+
     try:
         with gzip.open(file_path, "rb") as f:
-            peek = f.read(2048)
-            f.seek(0)
-            namespace = None
-            ns_match = re.search(
-                r'xmlns="([^"]+)"', peek.decode("utf-8", errors="ignore")
-            )
-            if ns_match:
-                namespace = ns_match.group(1)
-                logger.info(f"Detected namespace: {namespace} in {filename}")
-            ns_prefix = "{" + namespace + "}" if namespace else ""
             context = ET.iterparse(f, events=("start", "end"))
-            current_record = None
-            element_stack = []
-            pmid = None
-            title = ""
-            journal = ""
-            year = None
-            abstract = ""
-            authors = []
-            mesh_terms = []
+            in_pubmed_article = False
+            current_path = []
 
             for event, elem in context:
-                tag = elem.tag
-                if namespace and tag.startswith(ns_prefix):
-                    tag = tag[len(ns_prefix) :]
+                tag = elem.tag.split("}")[-1]
+
                 if event == "start":
-                    element_stack.append(tag)
-                    if tag in ("PubmedArticle", "PubmedBookArticle"):
-                        pmid = None
-                        title = ""
-                        journal = ""
-                        year = None
-                        abstract = ""
+                    current_path.append(tag)
+                    if tag == "PubmedArticle":
+                        in_pubmed_article = True
+                        pmid = title = journal = journal_iso = issn = issn_type = ""
+                        issn_linking = volume = issue = pagination = doi = pub_date = ""
+                        year = pub_status = language = vernacular_title = abstract = ""
                         authors = []
                         mesh_terms = []
+                        chemicals = []
+                        keywords = []
+                        publication_types = []
+                        in_author_list = in_author = False
+                        current_author_last_name = ""
+                        current_author_fore_name = ""
+                        current_author_initials = ""
+                        current_author_position = 0
+
+                    elif tag == "AuthorList":
+                        in_author_list = True
+                        current_author_position = 0
+
+                    elif tag == "Author" and in_author_list:
+                        in_author = True
+                        current_author_last_name = ""
+                        current_author_fore_name = ""
+                        current_author_initials = ""
+                        current_author_position += 1
+
                 elif event == "end":
-                    if element_stack:
-                        element_stack.pop()
-                    path = "/".join(element_stack + [tag])
-                    if tag == "PMID" and "PubmedArticle" in element_stack:
+                    if not in_pubmed_article:
+                        current_path.pop()
+                        elem.clear()
+                        continue
+
+                    if tag == "LastName":
+                        current_author_last_name = (
+                            elem.text.strip() if elem.text else ""
+                        )
+                    elif tag == "ForeName":
+                        current_author_fore_name = (
+                            elem.text.strip() if elem.text else ""
+                        )
+                    elif tag == "Initials":
+                        current_author_initials = elem.text.strip() if elem.text else ""
+                    elif tag == "CollectiveName":
+                        collective_name = elem.text.strip() if elem.text else ""
+                        if collective_name:
+                            authors.append((collective_name, current_author_position))
+                    elif tag == "Author":
+                        in_author = False
+                        name_part = current_author_fore_name or current_author_initials
+                        if current_author_last_name or name_part:
+                            if current_author_last_name and name_part:
+                                author_name = f"{name_part} {current_author_last_name}"
+                            else:
+                                author_name = current_author_last_name or name_part
+                            if author_name.strip():
+                                authors.append(
+                                    (author_name.strip(), current_author_position)
+                                )
+                    elif tag == "AuthorList":
+                        in_author_list = False
+                    elif tag == "PMID" and current_path[-2] in [
+                        "PubmedData",
+                        "MedlineCitation",
+                    ]:
                         pmid = elem.text.strip() if elem.text else ""
                     elif tag == "ArticleTitle":
                         title = elem.text.strip() if elem.text else ""
-                    elif tag == "Title" and "Journal" in element_stack:
+                    elif tag == "Title" and "Journal" in current_path:
                         journal = elem.text.strip() if elem.text else ""
-                    elif tag == "Year" and any(
-                        x in element_stack for x in ("PubDate", "JournalInfo")
-                    ):
+                    elif tag == "ISOAbbreviation":
+                        journal_iso = elem.text.strip() if elem.text else ""
+                    elif tag == "ISSN":
+                        issn = elem.text.strip() if elem.text else ""
+                        issn_type = elem.get("IssnType", "")
+                    elif tag == "ISSNLinking":
+                        issn_linking = elem.text.strip() if elem.text else ""
+                    elif tag == "Volume":
+                        volume = elem.text.strip() if elem.text else ""
+                    elif tag == "Issue":
+                        issue = elem.text.strip() if elem.text else ""
+                    elif tag == "MedlinePgn":
+                        pagination = elem.text.strip() if elem.text else ""
+                    elif tag == "ArticleId" and elem.get("IdType") == "doi":
+                        doi = elem.text.strip() if elem.text else ""
+                    elif tag == "Year" and "PubDate" in current_path:
+                        year_text = elem.text.strip() if elem.text else ""
                         try:
-                            year = int(elem.text.strip()) if elem.text else None
-                        except ValueError:
+                            year = int(year_text) if year_text.isdigit() else None
+                        except:
                             year = None
                     elif tag == "AbstractText":
-                        text = elem.text.strip() if elem.text else ""
-                        if text:
-                            abstract += " " + text if abstract else text
-                    elif tag == "Author":
-                        last_name = next(
-                            (e.text for e in elem.findall("./LastName") or []), ""
-                        )
-                        fore_name = next(
-                            (e.text for e in elem.findall("./ForeName") or []), ""
-                        )
-                        if last_name or fore_name:
-                            author_name = f"{fore_name} {last_name}".strip()
-                            if author_name:
-                                authors.append((author_name, len(authors) + 1))
+                        abstract_text = elem.text.strip() if elem.text else ""
+                        if abstract_text:
+                            abstract += (
+                                (" " + abstract_text) if abstract else abstract_text
+                            )
                     elif tag == "DescriptorName":
-                        term = elem.text.strip() if elem.text else ""
-                        if term:
-                            mesh_terms.append(term)
-                    elif tag in ("PubmedArticle", "PubmedBookArticle"):
+                        mesh_term = elem.text.strip() if elem.text else ""
+                        if mesh_term:
+                            mesh_terms.append(mesh_term)
+                    elif tag == "PubmedArticle":
+                        in_pubmed_article = False
                         if pmid and title:
                             record = PubMedRecord(
                                 pmid=pmid,
                                 title=title,
                                 title_normalized=normalize_text(title),
                                 journal=journal,
+                                journal_iso=journal_iso,
+                                issn=issn,
+                                issn_type=issn_type,
+                                issn_linking=issn_linking,
+                                volume=volume,
+                                issue=issue,
+                                pagination=pagination,
+                                doi=doi,
+                                pub_date=pub_date,
                                 year=year,
+                                pub_status=pub_status,
+                                language=language,
+                                vernacular_title=vernacular_title,
                                 abstract=abstract,
                                 authors=authors,
                                 mesh_terms=mesh_terms,
+                                chemicals=chemicals,
+                                keywords=keywords,
+                                publication_types=publication_types,
                                 source_file=filename,
                             )
                             records.append(record)
-                            if len(records) % 100 == 0:
-                                logger.info(
-                                    f"Extracted {len(records)} records so far from {filename}"
-                                )
-                    if event == "end":
-                        elem.clear()
-                        while elem.getprevious() is not None:
-                            del elem.getparent()[0]
-        logger.info(f"Extracted {len(records)} records from {filename}")
+
+                    current_path.pop()
+                    elem.clear()
+
         return records
+
     except Exception as e:
-        logger.error(f"Error processing {filename}: {str(e)}")
+        import traceback
+
+        print(f"Error: {e}")
+        print(traceback.format_exc())
         return []
 
 
