@@ -286,3 +286,37 @@ BEGIN
     REFRESH MATERIALIZED VIEW CONCURRENTLY enriched_publications;
 END;
 $$ LANGUAGE plpgsql;
+
+
+
+-- Update pubmed_records table to ensure it has all needed fields
+ALTER TABLE pubmed_records 
+  ADD COLUMN IF NOT EXISTS journal_iso VARCHAR(100),
+  ADD COLUMN IF NOT EXISTS issn_type VARCHAR(20),
+  ADD COLUMN IF NOT EXISTS pagination VARCHAR(50),
+  ADD COLUMN IF NOT EXISTS pub_status VARCHAR(50),
+  ADD COLUMN IF NOT EXISTS language VARCHAR(50),
+  ADD COLUMN IF NOT EXISTS vernacular_title TEXT;
+
+-- Update the pub_date column to handle text inputs
+ALTER TABLE pubmed_records 
+  ALTER COLUMN pub_date TYPE VARCHAR(100);
+  
+-- Create functions to properly handle date conversion
+CREATE OR REPLACE FUNCTION try_parse_date(text_date TEXT)
+RETURNS DATE AS $$
+BEGIN
+  IF text_date ~ '^[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}$' THEN
+    RETURN text_date::DATE;
+  ELSIF text_date ~ '^[0-9]{4}-[0-9]{1,2}$' THEN
+    RETURN (text_date || '-01')::DATE;
+  ELSIF text_date ~ '^[0-9]{4}$' THEN
+    RETURN (text_date || '-01-01')::DATE;
+  ELSE
+    RETURN NULL;
+  END IF;
+EXCEPTION
+  WHEN OTHERS THEN
+    RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
